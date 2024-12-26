@@ -1,1 +1,1 @@
-# SpikingNN
+# NeuroGen
