@@ -2,7 +2,16 @@ from __future__ import annotations
 from typing import List
 
 import numpy as np
+import scipy.stats as stats
 from neurogen.utils import Constants as c
+from enum import Enum
+
+
+class NeuronState(Enum):
+    RESTING = 1
+    DEPOLARIZING = 2
+    REPOLARIZING = 3
+    REDEPOLARIZING = 4
 
 
 class Neuron:
@@ -14,17 +23,16 @@ class Neuron:
         self.Vr  = Vr      # Resting membrane potential, in mV
         self.Ri  = Ri      # Axial resistance, in kΩ·cm²
         self.Cm  = Cm      # Membrane capacitance, in uF/cm^2
+        self.action_potential_threshold = -55.0  # Action potential threshold, in mV
+        self.action_potential_peak = 30.0  # Action potential peak, in mV
+        self.refractory_period_duration = 1.0  # Refractory period duration, in ms
 
         # State variables
         self.V = self.Vr  # Membrane potential
-        self.m = 0.0530   # Na⁺ activation
-        self.h = 0.5960   # Na⁺ inactivation
-        self.n = 0.3176   # K⁺ activation
-
-        self.dV = 0.0
-        self.dm = 0.0
-        self.dh = 0.0
-        self.dn = 0.0
+        self.state = NeuronState.RESTING
+        self._refractory_period_time = 0.0
+        self.m = 0
+        self.n = 0
 
         # Dendritic dendrites
         self.dendrites: List[Neuron] = []
@@ -45,41 +53,21 @@ class Neuron:
 
     @property
     def I_Na(self): # Sodium current (Na⁺), in µA/cm²
-        return c.G_NA * self.m**3 * self.h * (self.V - c.E_NA)
+        if self.state == NeuronState.DEPOLARIZING:
+            self.m = 1 / (1 + np.exp(-(self.V - self.action_potential_threshold) / 10.))
+            return c.G_NA * self.m**3 * (self.V - c.E_NA)
+        return 0
 
     @property
     def I_K(self): # Potassium current (K⁺), in µA/cm²
-        return c.G_K * self.n**4 * (self.V - c.E_K)
+        if self.state == NeuronState.REPOLARIZING:
+            self.n = stats.norm.cdf(self.V, -110, 110)
+            return c.G_K * self.n**4 * (self.V - c.E_K)
+        return 0
 
     @property
     def I_L(self): # Leak current, in µA/cm²
         return c.G_LEAK * (self.V - c.E_LEAK)
-
-    # Channel gating variables
-
-    @property
-    def alpha_m(self):
-        return 0.1 * (self.V + 40.0) / (1.0 - np.exp(-(self.V + 40.0) / 10.0))
-
-    @property
-    def beta_m(self):
-        return 4.0 * np.exp(-(self.V + 65.0) / 18.0)
-
-    @property
-    def alpha_h(self):
-        return 0.07 * np.exp(-(self.V + 65.0) / 20.0)
-
-    @property
-    def beta_h(self):
-        return 1.0 / (1.0 + np.exp(-(self.V + 35.0) / 10.0))
-
-    @property
-    def alpha_n(self):
-        return 0.01 * (self.V + 55.0) / (1.0 - np.exp(-(self.V + 55.0) / 10.0))
-
-    @property
-    def beta_n(self):
-        return 0.125 * np.exp(-(self.V + 65) / 80.0)
     
     # Synaptic current
 
@@ -92,13 +80,40 @@ class Neuron:
         return max(0, (self.V - self.Vr) / self.Ri)
     
     @property
-    def refractory_period(self):
-        return False
-        # Define thresholds for h and n to determine the refractory period
-        h_threshold = 0.4
-        n_threshold = 0.6
-
-        return self.h < h_threshold and self.n > n_threshold
+    def is_refractory(self):
+        return self.state != NeuronState.RESTING
+    
+    def update_state_variables(self, dt):
+        if self.is_refractory:
+            self._refractory_period_time += dt
+            if self._refractory_period_time >= self.refractory_period_duration:
+                self.state = NeuronState.RESTING
+                self._refractory_period_time = 0.0
+            elif self.V > self.action_potential_peak:
+                self.state = NeuronState.REPOLARIZING
+        elif self.V > self.action_potential_threshold:
+            self.state = NeuronState.DEPOLARIZING
+    
+    def update_state_variables(self, dt):
+        if self.is_refractory:
+            self._refractory_period_time += dt
+            if self._refractory_period_time >= self.refractory_period_duration:
+                self.state = NeuronState.RESTING
+                self._refractory_period_time = 0.0
+            elif self.V > self.action_potential_peak:
+                self.state = NeuronState.REPOLARIZING
+            elif self.V < c.E_K*0.95:
+                self.state = NeuronState.REDEPOLARIZING
+        elif self.V > self.action_potential_threshold:
+            self.state = NeuronState.DEPOLARIZING
+    
+    def integrate(self, dt):
+        self.update_state_variables(dt)
+        I_in = - self.I_Na - self.I_K - self.I_L
+        if not self.is_refractory:
+            I_in += self.I_app(self) + self.I_synin
+        dVdt = I_in / self.Cm
+        self.V +=  dVdt * dt
     
     def connect(self, neuron: Neuron, dendrite_index: int = None):
         if self.is_connected_to(neuron):
@@ -116,32 +131,6 @@ class Neuron:
     
     def is_connected_to(self, neuron: Neuron):
         return neuron in self.connected_to or any(dendrite in self.connected_to for dendrite in neuron.dendrites)
-
-    def integrate(self, dt):
-        I_in = - self.I_Na - self.I_K - self.I_L
-        if not self.refractory_period:
-            I_in += self.I_app(self) + self.I_synin
-        dVdt = I_in / self.Cm
-        self.dV = dVdt * dt
-
-        for _ in range(10):
-            self.update_gating_variables(dt)
-    
-    def update_gating_variables(self, dt):
-        dmdt = self.alpha_m * (1.0 - self.m) - self.beta_m * self.m
-        dhdt = self.alpha_h * (1.0 - self.h) - self.beta_h * self.h
-        dndt = self.alpha_n * (1.0 - self.n) - self.beta_n * self.n
-
-        self.dm = dmdt * dt
-        self.dh = dhdt * dt
-        self.dn = dndt * dt
-
-        self.m += self.dm
-        self.h += self.dh
-        self.n += self.dn
-    
-    def update(self):
-        self.V += self.dV
 
 
 class Dendrite(Neuron):
@@ -167,5 +156,5 @@ class InputNeuron(Dendrite):
     def integrate(self, dt):
         pass
 
-    def update(self):
+    def update(self, dt):
         pass

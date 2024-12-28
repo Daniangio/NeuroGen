@@ -32,8 +32,6 @@ class NeuralNetwork:
     def step(self, dt):
         for neuron in self.all_unique_neurons_and_dendrites:
             neuron.integrate(dt)
-        for neuron in self.all_unique_neurons_and_dendrites:
-            neuron.update()
     
     def plot(self):
         fig, ax = plt.subplots()
